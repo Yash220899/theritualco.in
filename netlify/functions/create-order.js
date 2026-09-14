@@ -1,6 +1,7 @@
 const Razorpay = require("razorpay");
 const { createClient } = require("@supabase/supabase-js");
 const { PRODUCT_MAP, resolveProductKey } = require("./shared/product-map");
+const { KIT_MAP } = require("./shared/kit-map");
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -27,50 +28,110 @@ exports.handler = async (event) => {
         let totalPaise = 0;
         const orderItems = [];
 
+
         for (const item of cart) {
+            const kit = KIT_MAP[item.id];
+
+            if (kit) {
+                // ── Kit purchase: validate + price EVERY component, all in the
+                //    customer's chosen colour. If ANY component isn't active in
+                //    that colour, the whole kit line is skipped (all-or-nothing —
+                //    a kit can't ship half-finished).
+                const kitColor = item.color || "default";
+                let kitValid = true;
+                const kitLineItems = [];
+
+                for (const comp of kit.components) {
+                    const compProduct = PRODUCT_MAP[comp.product_id];
+                    if (!compProduct) { kitValid = false; break; }
+
+                    const { data: inv, error: invErr } = await supabase
+                        .from("inventory")
+                        .select("active")
+                        .eq("product_id", comp.product_id)
+                        .eq("color", kitColor)
+                        .single();
+
+                    if (invErr || !inv || !inv.active) { kitValid = false; break; }
+
+                    kitLineItems.push({
+                        product_id:    comp.product_id,
+                        product_name:  compProduct.name + " (from " + kit.name + ")",
+                        weight:        compProduct.weight,
+                        color:         kitColor,
+                        quantity:      comp.qty,
+                        unit_paise:    0, // component price not separately charged — kit has one bundled price
+                        is_early_bird: false,
+                        is_kit_component: true,
+                    });
+                }
+
+                if (!kitValid) {
+                    console.error(`Kit "${kit.id}" unavailable in colour "${kitColor}" — one or more components inactive`);
+                    continue; // whole kit skipped, matches existing silent-skip pattern elsewhere in this loop
+                }
+
+                // One summary line for what the customer actually bought...
+                totalPaise += kit.price_paise;
+                orderItems.push({
+                    product_id:    kit.id,
+                    product_name:  kit.name,
+                    weight:        null,
+                    color:         kitColor,
+                    quantity:      1,
+                    unit_paise:    kit.price_paise,
+                    is_early_bird: false,
+                    is_kit: true,
+                    kit_components: kitLineItems, // ...plus the full breakdown, for packing/fulfillment
+                });
+
+                continue; // skip the normal single-product resolution below for this cart entry
+            }
+
+            // ── Normal (non-kit) product — existing logic, unchanged ───
             const key = resolveProductKey(item);
             const product = key && PRODUCT_MAP[key];
             if (!product) continue;
 
-                const { data: inv, error: invErr } = await supabase
-                    .from("inventory")
-.select("stock, sold, early_bird_limit, early_bird_price_paise, price_paise, active, sku")
-                    .eq("product_id", product.id)
-                    .eq("color", item.color || "default")
-                    .single();
-                if (invErr || !inv || !inv.active) continue;
+            const { data: inv, error: invErr } = await supabase
+                .from("inventory")
+                .select("stock, sold, early_bird_limit, early_bird_price_paise, price_paise, active, sku")
+                .eq("product_id", product.id)
+                .eq("color", item.color || "default")
+                .single();
+            if (invErr || !inv || !inv.active) continue;
 
-                const isEarlyBird = inv.sold < inv.early_bird_limit;
-                const unitPaise   = isEarlyBird ? inv.early_bird_price_paise : inv.price_paise;
-                const qty         = Math.max(1, Math.min(10, parseInt(item.qty) || 1));
+            const isEarlyBird = inv.sold < inv.early_bird_limit;
+            const unitPaise   = isEarlyBird ? inv.early_bird_price_paise : inv.price_paise;
+            const qty         = Math.max(1, Math.min(10, parseInt(item.qty) || 1));
 
-                // ── Stock guard: reject if insufficient remaining units ──
-                const remaining = Number(inv.stock) || 0;
-                if (remaining < qty) {
-                    return {
-                        statusCode: 409,
-                        body: JSON.stringify({
-                            error: `Only ${remaining} unit${remaining === 1 ? "" : "s"} of ${product.name} (${item.color || "default"}) left in stock. Please reduce the quantity and try again.`,
-                            code: "OUT_OF_STOCK",
-                            available: remaining,
-                            product: product.name,
-                            color: item.color || "default",
-                        }),
-                    };
-                }
-
-                totalPaise += unitPaise * qty;
-                orderItems.push({
-                    product_id:    product.id,
-                    product_name:  product.name,
-                    weight:        product.weight,
-                    color:         item.color || "Not specified",
-                    quantity:      qty,
-                    sku_id:        inv.sku || null,
-                    unit_paise:    unitPaise,
-                    is_early_bird: isEarlyBird,
-                });
+            // ── Stock guard: reject if insufficient remaining units ──
+            const remaining = Number(inv.stock) || 0;
+            if (remaining < qty) {
+                return {
+                    statusCode: 409,
+                    body: JSON.stringify({
+                        error: `Only ${remaining} unit${remaining === 1 ? "" : "s"} of ${product.name} (${item.color || "default"}) left in stock. Please reduce the quantity and try again.`,
+                        code: "OUT_OF_STOCK",
+                        available: remaining,
+                        product: product.name,
+                        color: item.color || "default",
+                    }),
+                };
             }
+
+            totalPaise += unitPaise * qty;
+            orderItems.push({
+                product_id:    product.id,
+                product_name:  product.name,
+                weight:        product.weight,
+                color:         item.color || "Not specified",
+                quantity:      qty,
+                sku_id:        inv.sku || null,
+                unit_paise:    unitPaise,
+                is_early_bird: isEarlyBird,
+            });
+        }
 
         if (totalPaise === 0) {
             return { statusCode: 400, body: JSON.stringify({ error: "No valid items in cart" }) };
@@ -149,14 +210,25 @@ exports.handler = async (event) => {
         }
 
         if (isCod) {
-            for (const item of orderItems) {
-                const { data: ok, error: invErr } = await supabase.rpc("increment_sold", {
-                    p_product_id: item.product_id,
-                    p_color: item.color,
-                    p_qty: item.quantity || 1,
-                });
-                if (invErr) console.error("COD inventory increment error:", invErr);
-                else if (ok === false) console.error("COD oversell rejected:", item.product_id, item.color);
+            for (const orderItem of orderItems) {
+                if (orderItem.is_kit) {
+                    // Decrement each component separately
+                    for (const comp of orderItem.kit_components) {
+                        const { error: invErr } = await supabase.rpc("increment_sold", {
+                            p_product_id: comp.product_id,
+                            p_color:      comp.color,
+                        });
+                        if (invErr) console.error("Kit component inventory increment error:", invErr, comp.product_id, comp.color);
+                    }
+                } else {
+                    const { data: ok, error: invErr } = await supabase.rpc("increment_sold", {
+                        p_product_id: orderItem.product_id,
+                        p_color:      orderItem.color,
+                        p_qty:        orderItem.quantity || 1,
+                    });
+                    if (invErr) console.error("COD inventory increment error:", invErr);
+                    else if (ok === false) console.error("COD oversell rejected:", item.product_id, item.color);
+                }
             }
         }
 

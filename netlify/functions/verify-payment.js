@@ -72,16 +72,27 @@ exports.handler = async (event) => {
         // ── Increment inventory sold count — once per line item, per colour ───
         const items = order.items || [];
         for (const item of items) {
-            const { data: ok, error: invErr } = await supabase.rpc("increment_sold", {
-                p_product_id: item.product_id,
-                p_color:      item.color,
-                p_qty:        (item.quantity ?? item.qty ?? 1),
-            });
-            if (invErr) console.error("Inventory increment error:", invErr, "for", item.product_id, item.color);
-            else if (ok === false) {
-                // Payment succeeded but stock was already gone (race/last unit).
-                // Flag loudly so it can be resolved manually.
-                console.error("OVERSOLD: paid order exceeded stock", item.product_id, item.color, "order", order.id);
+            if (item.is_kit) {
+                for (const comp of item.kit_components) {
+                    const { error: invErr } = await supabase.rpc("increment_sold", {
+                        p_product_id: comp.product_id,
+                        p_color:      comp.color,
+                        p_qty:        (item.quantity ?? item.qty ?? 1),
+                    });
+                    if (invErr) console.error("Kit component inventory increment error:", invErr, comp.product_id, comp.color);
+                }
+            } else {
+                const { error: invErr } = await supabase.rpc("increment_sold", {
+                    p_product_id: item.product_id,
+                    p_color:      item.color,
+                    p_qty:        (item.quantity ?? item.qty ?? 1),
+                });
+                if (invErr) console.error("Inventory increment error:", invErr, item.product_id, item.color);
+                else if (ok === false) {
+                    // Payment succeeded but stock was already gone (race/last unit).
+                    // Flag loudly so it can be resolved manually.
+                    console.error("OVERSOLD: paid order exceeded stock", item.product_id, item.color, "order", order.id);
+                }
             }
         }
 
